@@ -93,8 +93,8 @@ def read_baseline(text: str) -> dict[str, Size]:
 
 def write_baseline(entries: dict[str, Size]) -> str:
     head = (
-        "# Files over the size limit when the check arrived: they may shrink, never grow.\n"
-        "# Regenerate with: file-size-check --update-baseline  (path, lines, bytes)\n"
+        "# Files over the size limit when the check arrived. They may not grow; after\n"
+        "# shrinking or deleting one, run: file-size-check --update-baseline  (path, lines, bytes)\n"
     )
     body = "".join(f"{p}\t{s.lines}\t{s.bytes}\n" for p, s in sorted(entries.items()))
     return head + body
