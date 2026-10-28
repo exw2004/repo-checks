@@ -16,10 +16,12 @@ Which functions are API calls is the repo's own business, so each repo lists the
 What the path pattern is made of:
 - String literals are the path. Anything computed (a variable, a cast, a call, `{$id}` in a
   double-quoted string) is one segment that matches anything.
-- A variable assigned exactly once in the same file is replaced by what it was assigned,
-  so `$line = '/orders/' . $id;  amf_post($line . '/pickup')` is `/orders/{?}/pickup`.
+- A variable assigned exactly once, with a plain `=`, in the same function (or the file's
+  top level) is replaced by what it was assigned, so `$line = '/orders/' . $id;
+  amf_post($line . '/pickup')` is `/orders/{?}/pickup`. A parameter, or a variable that is
+  also built up (`.=`) or bound by a loop or a catch, stays computed.
 - A query string is not part of the path: everything from `?` is dropped, and so is a
-  computed part glued onto a literal (`"/subs/{$id}/shipments{$qs}"`).
+  computed part glued onto the end of a literal (`"/subs/{$id}/shipments{$qs}"`).
 - A path that still starts with something computed (a variable from elsewhere) is checked
   by its literal end: some route must end that way.
 - A call with no literal path at all cannot be checked. It fails, unless the line has a
@@ -28,7 +30,8 @@ What the path pattern is made of:
 - A request made some other way (`file_get_contents($api . '/events')`) is declared with
   a comment on its line, `// api-contract: GET /events`, and checked like a call.
 
-Comments and inline HTML are skipped, so a doc comment mentioning `amf_get()` is not a call.
+Comments, inline HTML and the text inside strings are skipped when looking for calls, so a
+doc comment or an error message mentioning `amf_get()` is not a call.
 """
 
 from __future__ import annotations
@@ -40,11 +43,15 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from repo_checks.file_size import repo_root, tracked_files
+
 CONFIG = ".api-contract"
 SKIP = "api-contract: skip"
 _DECLARED = re.compile(r"api-contract:\s*(GET|POST|PUT|PATCH|DELETE)\s+(/\S*)")
 METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "ANY"}
+PHP_SUFFIXES = {".php", ".phtml", ".inc"}
 HOLE = "\x00"  # one computed part of a path
+SEP = "\x01"  # between the operands of a top-level `.`, until normalize()
 _WORD = re.compile(r"[A-Za-z_]\w*")
 
 
@@ -128,6 +135,23 @@ def _string_end(src: str, i: int) -> int:
     return j + 1
 
 
+def strings_blanked(code: str) -> str:
+    """code_only() text with the inside of every string literal blanked too, for finding
+    calls, assignments and braces without matching text that is only quoted."""
+    out = list(code)
+    i = 0
+    while i < len(code):
+        if code[i] in "'\"`":
+            j = _string_end(code, i)
+            for k in range(i + 1, min(j - 1, len(code))):
+                if out[k] != "\n":
+                    out[k] = " "
+            i = j
+        else:
+            i += 1
+    return "".join(out)
+
+
 # --- an argument → a path pattern ---------------------------------------------------
 
 
@@ -144,8 +168,8 @@ def _double_quoted(body: str) -> str:
         if c == "\\" and j + 1 < len(body):
             out.append(body[j + 1])
             j += 2
-        elif c == "{" and body.startswith("{$", j):
-            depth, k = 0, j
+        elif body.startswith(("{$", "${"), j):
+            depth, k = 0, j + (c == "$")
             while k < len(body):
                 depth += {"{": 1, "}": -1}.get(body[k], 0)
                 if depth == 0:
@@ -164,17 +188,85 @@ def _double_quoted(body: str) -> str:
     return "".join(out)
 
 
+# Every way a variable gets a value. Only a plain `=` can be read through; the rest are
+# counted so that a variable built up in steps, bound by a loop or a catch, or taken by
+# reference is never mistaken for its one assignment.
+_BINDS = re.compile(
+    r"\$(\w+)\s*(?:(=)(?![=>])|(?:\.|\?\?|\+|-)=)"  # =  .=  ??=  +=  -=
+    r"|\bas\s+&?\s*\$(\w+)"  # foreach ($xs as $x)
+    r"|=>\s*&?\s*\$(\w+)"  # foreach ($xs as $k => $x)
+    r"|\bcatch\s*\([^)$]*\$(\w+)"
+    r"|\b(?:global|static)\s+\$(\w+)"
+    r"|&\s*\$(\w+)"
+)
+
+
+@dataclass(frozen=True)
+class _Scope:
+    head: tuple[int, int]  # the parameter list, and any `use (...)`
+    body: tuple[int, int]
+
+
+def _scopes(bare: str) -> list[_Scope]:
+    """Every function and closure body, from strings_blanked() text."""
+    out: list[_Scope] = []
+    for m in re.finditer(r"\bfunction\b[^({;]*\(", bare):
+        i, depth = m.end(), 1
+        while i < len(bare) and depth:
+            depth += {"(": 1, ")": -1}.get(bare[i], 0)
+            i += 1
+        if u := re.compile(r"\s*use\s*\([^)]*\)").match(bare, i):
+            i = u.end()
+        head_end = i
+        brace = re.compile(r"[^{;]*\{").match(bare, i)
+        if not brace:
+            continue  # abstract or in an interface: no body
+        start = i = brace.end()
+        depth = 1
+        while i < len(bare) and depth:
+            depth += {"{": 1, "}": -1}.get(bare[i], 0)
+            i += 1
+        out.append(_Scope((m.end(), head_end), (start, i)))
+    return out
+
+
 class _Parser:
     """Reads one PHP expression (a call's first argument, or the right side of an
-    assignment) as a path pattern. Works on code_only() text."""
+    assignment) as a path pattern, from code_only() text.
+
+    The top-level operands of `.` are kept apart with SEP, so a raw URL's base can be told
+    from the path after it; normalize() removes them."""
 
     def __init__(self, code: str):
         self.code = code
-        self._assigned: dict[str, list[int]] = {}
-        # `.=` and `??=` count as assignments too, so a variable built up in steps is not
-        # mistaken for its first part.
-        for m in re.finditer(r"\$(\w+)\s*(\.|\?\?)?=(?![=>])", code):
-            self._assigned.setdefault(m.group(1), []).append(m.end())
+        bare = strings_blanked(code)
+        self._scopes = _scopes(bare)
+        # (variable, scope) → where each assignment's value starts; -1 for any binding
+        # that is not a plain `=`.
+        self._assigned: dict[tuple[str, int], list[int]] = {}
+        for m in _BINDS.finditer(bare):
+            name = m.group(1) or next(g for g in m.groups()[2:] if g)
+            at = m.end() if m.group(2) else -1
+            self._assigned.setdefault((name, self._scope_at(m.start())), []).append(at)
+
+    def _scope_at(self, i: int) -> int:
+        """The innermost function body around offset i, or -1 for the file's top level."""
+        best, size = -1, len(self.code) + 1
+        for k, sc in enumerate(self._scopes):
+            a, b = sc.body
+            if a <= i < b and b - a < size:
+                best, size = k, b - a
+        return best
+
+    def _value_at(self, name: str, i: int) -> int | None:
+        """Where the one plain assignment to $name in i's scope starts, if there is one."""
+        scope = self._scope_at(i)
+        if scope >= 0:
+            a, b = self._scopes[scope].head
+            if re.search(r"\$" + name + r"\b", self.code[a:b]):
+                return None  # a parameter: its value comes from the caller
+        spots = self._assigned.get((name, scope), [])
+        return spots[0] if len(spots) == 1 and spots[0] >= 0 else None
 
     def expr(self, i: int, stop: str, seen: frozenset[str] = frozenset()) -> str:
         out: list[str] = []
@@ -192,8 +284,7 @@ class _Parser:
                 j = _string_end(code, i)
                 if depth == 0:
                     body = code[i + 1 : j - 1]
-                    text = _single_quoted(body) if c == "'" else _double_quoted(body)
-                    out.append(text)
+                    out.append(_single_quoted(body) if c == "'" else _double_quoted(body))
                 i = j
             elif c in "([{":
                 if depth == 0:
@@ -207,18 +298,17 @@ class _Parser:
                 i += 1
             elif depth == 0 and c in stop:
                 break
-            elif c.isspace() or (c == "." and depth == 0):
+            elif c == "." and depth == 0:
+                out.append(SEP)
+                i += 1
+            elif c.isspace():
                 i += 1
             elif c == "$" and depth == 0 and (m := _WORD.match(code, i + 1)):
                 name = m.group(0)
                 j = m.end()
-                rest = code[j:j + 2]
-                spots = self._assigned.get(name, [])
-                if (
-                    len(spots) == 1 and name not in seen
-                    and not rest.startswith(("[", "->", "("))
-                ):
-                    out.append(self.expr(spots[0], ";", seen | {name}))
+                at = None if name in seen else self._value_at(name, i)
+                if at is not None and not code.startswith(("[", "->", "("), j):
+                    out.append(self.expr(at, ";", seen | {name}))
                 else:
                     hole()
                 i = j
@@ -226,18 +316,26 @@ class _Parser:
                 if depth == 0:
                     hole()
                 i += 1
-        return re.sub(HOLE + "+", HOLE, "".join(out))
+        return "".join(out)
 
 
 def normalize(raw: str, method: str) -> str | None:
-    """A path pattern from an argument's text, or None when no part of it is literal."""
-    path = raw.split("?", 1)[0]
-    # A computed part glued onto a literal is a suffix (a query string), not a segment.
-    path = re.sub("(?<=[^/" + HOLE + "])" + HOLE + ".*", "", path, flags=re.S)
+    """A path pattern from expr() text, or None when no part of it is literal."""
     if method == "ANY":
-        path = path.removeprefix(HOLE)  # the base URL
-        if not path.startswith("/"):
+        # The first operand, when it is all computed, is the base URL. Anything computed
+        # after it stays: the path is then matched on its end.
+        first, _, rest = raw.partition(SEP)
+        if first and not first.strip(HOLE + SEP) and rest:
+            raw = rest
+        elif not first.startswith("/"):
             return None  # a URL somewhere else, or nothing literal
+    path = re.sub(HOLE + "+", HOLE, raw.replace(SEP, ""))
+    path = path.split("?", 1)[0]
+    # A computed part glued onto the end of a literal is a suffix (a query string held in
+    # a variable), not a segment. One with more path after it is part of a segment.
+    path = re.sub("(?<=[^/" + HOLE + "])" + HOLE + "[^/]*$", "", path)
+    if method == "ANY" and not path.startswith(("/", HOLE)):
+        return None
     if not path.replace(HOLE, "").strip("/"):
         return None
     return path
@@ -264,7 +362,9 @@ def matches(path: str, route_path: str) -> bool:
             return False
         return all(_segment_ok(c, r) for c, r in zip(tail, route[-len(tail):], strict=True))
     call = _segments(path)
-    return len(call) == len(route) and all(_segment_ok(c, r) for c, r in zip(call, route, strict=True))
+    return len(call) == len(route) and all(
+        _segment_ok(c, r) for c, r in zip(call, route, strict=True)
+    )
 
 
 def check(calls: list[Call], routes: list[tuple[str, str]]) -> list[Problem]:
@@ -290,7 +390,7 @@ def check(calls: list[Call], routes: list[tuple[str, str]]) -> list[Problem]:
 
 
 def read_config(text: str) -> dict[str, str]:
-    """`function METHOD` per line; `#` comments and blank lines ignored."""
+    """`function METHOD` per line; `#` comments and blank lines ignored. At least one."""
     out: dict[str, str] = {}
     for n, raw in enumerate(text.splitlines(), 1):
         line = raw.split("#", 1)[0].strip()
@@ -303,32 +403,42 @@ def read_config(text: str) -> dict[str, str]:
                 f"(METHOD one of {', '.join(sorted(METHODS))}): {raw!r}"
             )
         out[parts[0]] = parts[1]
+    if not out:
+        raise ValueError(f"{CONFIG} lists no functions: add one `function METHOD` per line")
     return out
 
 
 def read_routes(text: str) -> list[tuple[str, str]]:
+    """`METHOD /path` per line; `#` comments and blank lines ignored."""
     out: list[tuple[str, str]] = []
-    for raw in text.splitlines():
-        if raw.strip():
-            method, path = raw.split(None, 1)
-            out.append((method.upper(), path.strip()))
+    for n, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) != 2 or not parts[1].startswith("/"):
+            raise ValueError(f"routes line {n} is not `METHOD /path`: {raw!r}")
+        out.append((parts[0].upper(), parts[1]))
     return out
 
 
 def find_calls(src: str, file: str, functions: dict[str, str]) -> list[Call]:
     code = code_only(src)
-    lines = src.splitlines()
+    bare = strings_blanked(code)
+    lines = src.split("\n")  # numbered as bare.count("\n") numbers them; not splitlines()
     parser = _Parser(code)
-    call_re = re.compile(r"(?<![\w$>:\\])(" + "|".join(map(re.escape, functions)) + r")\s*\(")
+    # Not after `->` or `::` (a method), `$` or a word character (another name). After a
+    # `\` it is still the function, called by its global name.
+    call_re = re.compile(r"(?<![\w$>:])(" + "|".join(map(re.escape, functions)) + r")\s*\(")
     out: list[Call] = []
     for n, text in enumerate(lines, 1):
         if d := _DECLARED.search(text):
             path = re.sub(r"\{[^}/]*\}", HOLE, d.group(2))
             out.append(Call(file, n, d.group(1), path))
-    for m in call_re.finditer(code):
-        if re.search(r"\bfunction\s+$", code[max(0, m.start() - 20):m.start()]):
+    for m in call_re.finditer(bare):
+        if re.search(r"\bfunction\s+&?\s*$", bare[max(0, m.start() - 20):m.start()]):
             continue  # the definition, not a call
-        line = code.count("\n", 0, m.start()) + 1
+        line = bare.count("\n", 0, m.start()) + 1
         if SKIP in lines[line - 1] or _DECLARED.search(lines[line - 1]):
             continue
         method = functions[m.group(1)]
@@ -339,16 +449,13 @@ def find_calls(src: str, file: str, functions: dict[str, str]) -> list[Call]:
     return out
 
 
-def repo_calls(root: Path) -> list[Call]:
+def repo_calls(start: str) -> list[Call]:
+    root = repo_root(start)
     functions = read_config((root / CONFIG).read_text())
-    files = subprocess.run(
-        ["git", "-C", str(root), "ls-files", "-z", "--", "*.php"],
-        check=True, capture_output=True, text=True,
-    ).stdout.split("\0")
     calls: list[Call] = []
-    for f in sorted(p for p in files if p):
+    for f in sorted(tracked_files(root)):
         path = root / f
-        if path.is_file() and not path.is_symlink():
+        if path.suffix.lower() in PHP_SUFFIXES and path.is_file() and not path.is_symlink():
             calls.extend(find_calls(path.read_text(errors="replace"), f, functions))
     return calls
 
@@ -358,21 +465,28 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--routes", required=True,
                     help="the API's route list, `METHOD /path` per line (amf-vps tests/routes.txt)")
     ap.add_argument("repos", nargs="*", default=["."],
-                    help=f"PHP repos to check, each with a {CONFIG} (default: .)")
+                    help=f"PHP repos to check (any path inside each), each with a {CONFIG}")
     args = ap.parse_args(argv)
 
-    routes = read_routes(Path(args.routes).read_text())
+    try:
+        routes = read_routes(Path(args.routes).read_text())
+    except (OSError, ValueError) as e:
+        print(f"{args.routes}: {e}", file=sys.stderr)
+        return 1
     failed = False
     for repo in args.repos:
-        root = Path(repo)
         try:
-            calls = repo_calls(root)
-        except (OSError, ValueError, subprocess.CalledProcessError) as e:
+            calls = repo_calls(repo)
+        except subprocess.CalledProcessError:
+            print(f"{repo}: not inside a git repository", file=sys.stderr)
+            failed = True
+            continue
+        except (OSError, ValueError) as e:
             print(f"{repo}: {e}", file=sys.stderr)
             failed = True
             continue
         problems = check(calls, routes)
-        name = root.resolve().name
+        name = repo_root(repo).name
         for pr in problems:
             print(f"{name}/{pr.where}: {pr.message}", file=sys.stderr)
         if problems:

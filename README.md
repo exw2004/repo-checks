@@ -83,7 +83,7 @@ Two comments cover the rest, on the call's line:
 | Comment | For |
 |---|---|
 | `// api-contract: skip <why>` | A call whose path is all computed, such as the client's own pass-through. Without it, such a call fails |
-| `// api-contract: GET /events` | A request made another way (`file_get_contents($api . '/events')`), checked like a call |
+| `// api-contract: GET /events` | A request made another way (`file_get_contents($api . '/events')`), checked like a call. Also worth putting on an `ANY` line: `ANY /feedback/app` also matches `GET /feedback/{id}`, and the comment pins the method |
 
 Only paths and methods are checked, not request or response fields.
 
