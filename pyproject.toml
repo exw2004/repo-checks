@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "repo-checks"
-version = "0.1.0"
+version = "0.2.0"
 description = "Checks every repo runs the same way in CI and locally. First: files small enough for Claude to read whole."
 requires-python = ">=3.10"
 dependencies = []

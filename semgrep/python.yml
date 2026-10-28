@@ -1,0 +1,43 @@
+rules:
+  - id: request-value-in-sql-string
+    mode: taint
+    languages: [python]
+    severity: ERROR
+    message: >-
+      A request value reaches the SQL text of execute(). Pass it as a %s parameter
+      instead: cur.execute("... WHERE id = %s", (value,)). Identifiers (column, table,
+      sort order) cannot be parameters; map the request value through a fixed dict and
+      interpolate the dict's value, never the request's.
+    pattern-sources:
+      # Every parameter of a FastAPI route: path, query, body model, header.
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  @$ROUTER.$METHOD(...)
+                  def $F(..., $P, ...): ...
+              - pattern-inside: |
+                  @$ROUTER.$METHOD(...)
+                  async def $F(..., $P, ...): ...
+          - metavariable-regex:
+              metavariable: $METHOD
+              regex: ^(get|post|put|patch|delete|api_route)$
+          - focus-metavariable: $P
+    # A placeholder list sized to the request, ",".join(["%s"] * len(ids)): the length
+    # of a request value is only an int.
+    pattern-sanitizers:
+      - pattern: len(...)
+      # A lookup in a constant allowlist, _SORT.get(sort, "name") or _SORT[sort]: the
+      # value that comes out is one the code wrote.
+      - patterns:
+          - pattern-either:
+              - pattern: $D.get(...)
+              - pattern: $D[...]
+          - metavariable-regex:
+              metavariable: $D
+              regex: ^_?[A-Z][A-Z0-9_]*$
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $CUR.execute($Q, ...)
+              - pattern: $CUR.executemany($Q, ...)
+          - focus-metavariable: $Q
