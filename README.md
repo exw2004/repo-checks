@@ -53,6 +53,40 @@ audit:
 |---|---|
 | `python.yml` `request-value-in-sql-string` | A FastAPI route parameter reaching the SQL text of a PyMySQL `execute()` / `executemany()`, through f-strings, `+` or `.format`. A placeholder list sized with `len()` and a lookup in an UPPER_CASE allowlist dict are allowed. |
 
+## api-contract-check
+
+Fails when a PHP repo calls an API route the API does not have. The sites call amf-vps by
+path, as a plain string, so a route renamed or removed on the API side breaks a page
+silently. This reads every call, turns its path argument into a pattern (string literals
+are the path, anything computed is one segment), and checks it against the API's route
+list, `METHOD /path/{param}` per line, as amf-vps commits it in `tests/routes.txt`.
+
+```bash
+api-contract-check --routes ../amf-vps/tests/routes.txt          # this repo
+api-contract-check --routes tests/routes.txt ../site ../app      # from the API's side
+```
+
+Each PHP repo lists its client functions in `.api-contract`, `function METHOD` per line
+(`ANY` for a raw URL such as `curl_init`, where a computed start is the base URL):
+
+```
+amf_get     GET
+amf_post    POST
+curl_init   ANY
+```
+
+Comments and inline HTML are skipped. A variable assigned once in the same file is read
+through (`$line = '/orders/' . $id; amf_post($line . '/pickup')`), a query string is
+dropped, and a path that still starts with something computed is matched on its end.
+Two comments cover the rest, on the call's line:
+
+| Comment | For |
+|---|---|
+| `// api-contract: skip <why>` | A call whose path is all computed, such as the client's own pass-through. Without it, such a call fails |
+| `// api-contract: GET /events` | A request made another way (`file_get_contents($api . '/events')`), checked like a call. Also worth putting on an `ANY` line: `ANY /feedback/app` also matches `GET /feedback/{id}`, and the comment pins the method |
+
+Only paths and methods are checked, not request or response fields.
+
 ## In a repo
 
 ```make
